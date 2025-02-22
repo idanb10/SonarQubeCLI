@@ -1,85 +1,163 @@
-import argparse
 import os
 import subprocess
-import sys
 import yaml
+from flask import Flask, request, render_template, jsonify
+from werkzeug.utils import secure_filename
+import zipfile
+import shutil
+import secrets
 
-def load_sonarqube_url(config_path="config.yaml"):
-    if not os.path.exists(config_path):
-        print(f"❌ Error: Configuration file '{config_path}' not found.")
-        sys.exit(1)
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.secret_key = secrets.token_hex(16)
 
+ALLOWED_EXTENSIONS = {'zip'}
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def get_project_key_from_filename(filename):
+    """Extract project key from the zip filename."""
+    # Remove .zip extension and sanitize for SonarQube project key
+    project_key = os.path.splitext(filename)[0]
+    # Replace spaces and special characters with underscores
+    project_key = ''.join(c if c.isalnum() else '_' for c in project_key)
+    return project_key
+
+def load_sonarqube_config(config_path="config.yaml"):
+    """Load SonarQube configuration from YAML file."""
     try:
         with open(config_path, "r") as file:
             config = yaml.safe_load(file)
             return config["sonarqube_url"], config["sonarscanner_path"]
-    except (yaml.YAMLError, KeyError) as e:
-        print(f"❌ Error parsing configuration file: {e}")
-        sys.exit(1)
-
-SONARQUBE_URL, SONARSCANNER_PATH = load_sonarqube_url()
+    except (yaml.YAMLError, KeyError, FileNotFoundError) as e:
+        raise Exception(f"Error loading configuration: {str(e)}")
 
 def run_command(command, cwd):
-    """Helper function to execute shell commands."""
+    """Execute shell commands and return output."""
     try:
-        process = subprocess.run(command, shell=True, cwd=cwd, check=True, text=True)
-        print(f"✅ Successfully executed: {command}")
-        return process.returncode
+        process = subprocess.run(
+            command,
+            shell=True,
+            cwd=cwd,
+            check=True,
+            text=True,
+            capture_output=True
+        )
+        return True, process.stdout
     except subprocess.CalledProcessError as e:
-        print(f"❌ Command failed: {command}\n{e}")
-        sys.exit(1)
+        return False, str(e)
+
+def extract_zip(zip_path, extract_path):
+    """Extract uploaded ZIP file to a temporary directory."""
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_path)
 
 def scan_codebase(codebase_path, language, project_key, sonarqube_token):
-    """Runs SonarQube scan based on the programming language."""
-    if not os.path.exists(codebase_path):
-        print(f"❌ Error: Codebase path '{codebase_path}' not found.")
-        sys.exit(1)
-
-    print(f"🔍 Scanning project: {project_key} ({language}) using {SONARQUBE_URL}")
-
+    """Run SonarQube scan based on the programming language."""
+    sonarqube_url, sonarscanner_path = load_sonarqube_config()
+    
     if language.lower() in [".net framework"]:
-        solution_file = None
-        for file in os.listdir(codebase_path):
-            if file.endswith(".sln"):
-                solution_file = file
-                break
-
+        # Find .sln file
+        solution_file = next((f for f in os.listdir(codebase_path) if f.endswith('.sln')), None)
         if not solution_file:
-            print("❌ Error: No solution (.sln) file found in the codebase directory.")
-            sys.exit(1)
-            
-        run_command(f'dotnet sonarscanner begin /k:"{project_key}" /d:sonar.token="{sonarqube_token}" /d:sonar.host.url="{SONARQUBE_URL}"', codebase_path)
-        run_command(f'msbuild  "{solution_file}" /t:Rebuild /p:Configuration=Release', codebase_path)
-        run_command(f'dotnet sonarscanner end /d:sonar.token="{sonarqube_token}"', codebase_path)
-
+            raise Exception("No solution (.sln) file found in the codebase directory.")
+        
+        commands = [
+            f'dotnet-sonarscanner begin /k:"{project_key}" /d:sonar.token="{sonarqube_token}" /d:sonar.host.url="{sonarqube_url}"',
+            f'msbuild "{solution_file}" /t:Rebuild /p:Configuration=Release',
+            f'dotnet-sonarscanner end /d:sonar.token="{sonarqube_token}"'
+        ]
+    
     elif language.lower() in [".net core"]:
-        run_command(f'dotnet sonarscanner begin /k:"{project_key}" /d:sonar.token="{sonarqube_token}" /d:sonar.host.url="{SONARQUBE_URL}"', codebase_path)
-        run_command("dotnet build --no-incremental", codebase_path)
-        run_command(f'dotnet sonarscanner end /d:sonar.token="{sonarqube_token}"', codebase_path)
-
-    elif language.lower() in ["java (maven)", "maven"]:
-        run_command(f'mvn clean verify sonar:sonar -Dsonar.token={sonarqube_token} -Dsonar.host.url={SONARQUBE_URL} -Dsonar.projectKey={project_key}', codebase_path)
-
-    elif language.lower() in ["java (gradle)", "gradle"]:
-        run_command(f'gradle sonar -Dsonar.token={sonarqube_token} -Dsonar.host.url={SONARQUBE_URL} -Dsonar.projectKey={project_key}', codebase_path)
-
+        commands = [
+            f'dotnet-sonarscanner begin /k:"{project_key}" /d:sonar.token="{sonarqube_token}" /d:sonar.host.url="{sonarqube_url}"',
+            "dotnet build --no-incremental",
+            f'dotnet-sonarscanner end /d:sonar.token="{sonarqube_token}"'
+        ]
+    
     elif language.lower() in ["python", "javascript", "typescript"]:
-        run_command(f'"{SONARSCANNER_PATH}" -D"sonar.projectKey={project_key}" -D"sonar.sources=." -D"sonar.host.url={SONARQUBE_URL}" -D"sonar.token={sonarqube_token}"', codebase_path)
-
+        commands = [
+            f'"{sonarscanner_path}" -D"sonar.projectKey={project_key}" '
+            f'-D"sonar.sources=." -D"sonar.host.url={sonarqube_url}" '
+            f'-D"sonar.token={sonarqube_token}"'
+        ]
+        print(commands[0])
+    
     else:
-        print(f"⚠️ Unsupported language: {language}")
-        sys.exit(1)
+        raise Exception(f"Unsupported language: {language}")
 
-    print("✅ Scan completed successfully!")
+    outputs = []
+    for cmd in commands:
+        success, output = run_command(cmd, codebase_path)
+        if not success:
+            raise Exception(f"Command failed: {cmd}\nError: {output}")
+        outputs.append(output)
+    
+    return outputs
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SonarQube Code Scanner")
-    parser.add_argument("--codebase", required=True, help="Path to the codebase folder")
-    parser.add_argument("--language", required=True, help="Programming language (e.g., .NET Framework, Java (Maven), Python)")
-    parser.add_argument("--project-key", required=True, help="Project key for SonarQube")
-    parser.add_argument("--token", required=True, help="SonarQube authentication token")
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-    args = parser.parse_args()
+@app.route('/scan', methods=['POST'])
+def scan():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    
+    if not allowed_file(file.filename):
+        return jsonify({'error': 'Invalid file type. Please upload a ZIP file'}), 400
 
-    scan_codebase(args.codebase, args.language, args.project_key, args.token)
+    try:
+        # Create unique working directory
+        work_dir = os.path.join(app.config['UPLOAD_FOLDER'], secrets.token_hex(8))
+        os.makedirs(work_dir, exist_ok=True)
+        
+        # Save and extract ZIP file
+        original_filename = secure_filename(file.filename)
+        zip_path = os.path.join(work_dir, original_filename)
+        file.save(zip_path)
+        extract_path = os.path.join(work_dir, 'extracted')
+        extract_zip(zip_path, extract_path)
+        
+        # Get form data
+        user_provided_key = request.form.get('projectKey')
+        
+        # Use user-provided key if available, otherwise derive from filename
+        if user_provided_key and user_provided_key.strip():
+            project_key = user_provided_key.strip()
+        else:
+            project_key = get_project_key_from_filename(original_filename)
+        
+        # Get other form data
+        language = request.form.get('language')
+        token = request.form.get('token')
+        
+        # Run scan
+        scan_output = scan_codebase(extract_path, language, project_key, token)
+        
+        # Clean up
+        shutil.rmtree(work_dir)
+        
+        return jsonify({
+            'success': True,
+            'message': f'Scan completed successfully for project: {project_key}',
+            'project_key': project_key,
+            'output': scan_output
+        })
+        
+    except Exception as e:
+        # Clean up on error
+        if 'work_dir' in locals():
+            shutil.rmtree(work_dir)
+        return jsonify({'error': str(e)}), 500
 
+if __name__ == '__main__':
+    # Ensure upload directory exists
+    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+    app.run(debug=True)
