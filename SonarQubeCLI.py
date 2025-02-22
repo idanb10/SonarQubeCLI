@@ -30,7 +30,11 @@ def load_sonarqube_config(config_path="config.yaml"):
     try:
         with open(config_path, "r") as file:
             config = yaml.safe_load(file)
-            return config["sonarqube_url"], config["sonarscanner_path"]
+            return (
+                config["sonarqube_url"], 
+                config["sonarscanner_path"],
+                config["sonarqube_token"]  # Add token to the returned values
+            )
     except (yaml.YAMLError, KeyError, FileNotFoundError) as e:
         raise Exception(f"Error loading configuration: {str(e)}")
 
@@ -54,9 +58,9 @@ def extract_zip(zip_path, extract_path):
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall(extract_path)
 
-def scan_codebase(codebase_path, language, project_key, sonarqube_token):
+def scan_codebase(codebase_path, language, project_key):
     """Run SonarQube scan based on the programming language."""
-    sonarqube_url, sonarscanner_path = load_sonarqube_config()
+    sonarqube_url, sonarscanner_path, sonarqube_token = load_sonarqube_config()
     
     if language.lower() in [".net framework"]:
         # Find .sln file
@@ -83,7 +87,6 @@ def scan_codebase(codebase_path, language, project_key, sonarqube_token):
             f'-D"sonar.sources=." -D"sonar.host.url={sonarqube_url}" '
             f'-D"sonar.token={sonarqube_token}"'
         ]
-        print(commands[0])
     
     else:
         raise Exception(f"Unsupported language: {language}")
@@ -134,12 +137,11 @@ def scan():
         else:
             project_key = get_project_key_from_filename(original_filename)
         
-        # Get other form data
+        # Get language from form data
         language = request.form.get('language')
-        token = request.form.get('token')
         
         # Run scan
-        scan_output = scan_codebase(extract_path, language, project_key, token)
+        scan_output = scan_codebase(extract_path, language, project_key)
         
         # Clean up
         shutil.rmtree(work_dir)
