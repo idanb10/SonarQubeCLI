@@ -9,7 +9,7 @@ import secrets
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 16MB max file size
 app.secret_key = secrets.token_hex(16)
 
 ALLOWED_EXTENSIONS = {'zip'}
